@@ -135,3 +135,13 @@ def test_sqlite_store_roundtrip(tmp_path):
     assert s.list_documents("u:1", pipeline="p")[0]["review"]["k"] == 2
     assert s.list_pipeline_owners("p") == ["u:1"]
     assert s.delete_document(did, "u:2") is False and s.delete_document(did, "u:1") is True
+
+
+def test_sender_defaults_to_the_signed_in_person(app_client):
+    c = app_client
+    _setup(c)                                       # admin "Ada", admin@example.com
+    e = c.post("/v1/esign/envelopes", json={"title": "NDA"}).json()
+    env = c.get(f"/v1/esign/envelopes/{e['id']}").json()
+    assert env["sender_name"] == "Ada" and env["sender_email"] == "admin@example.com"
+    e2 = c.post("/v1/esign/envelopes", json={"title": "NDA", "sender_name": "Legal team"}).json()
+    assert c.get(f"/v1/esign/envelopes/{e2['id']}").json()["sender_name"] == "Legal team"

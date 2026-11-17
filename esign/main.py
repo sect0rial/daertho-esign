@@ -52,8 +52,13 @@ def _log_activity(request, event_type, caller, payload=None, response=None):
                         "payload": payload if isinstance(payload, (dict, list, str, int, float)) else None})
 
 
+def _owner_profile(owner: str) -> dict:
+    u = STORE.get_user(owner[2:]) if str(owner).startswith("u:") else None
+    return {"name": u["name"] or "", "email": u["email"]} if u else {}
+
+
 esign.configure(lambda: STORE, require_key=auth.require_key, session_label=auth.session_label,
-                log_activity=_log_activity)
+                log_activity=_log_activity, owner_profile=_owner_profile)
 
 if hasattr(esign, "ensure_pki"):
     esign.ensure_pki(store.data_dir())

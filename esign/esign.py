@@ -103,7 +103,11 @@ _session_payload = None
 _log_activity = None
 
 
-def configure(get_repo, require_key=None, session_label=None, log_activity=None, session_payload=None):
+_owner_profile = None
+
+
+def configure(get_repo, require_key=None, session_label=None, log_activity=None, session_payload=None,
+              owner_profile=None):
     """main.py wires the document store + its auth helpers (avoids a circular import).
     get_repo() -> the store; require_key(request, x_api_key) -> owner id or raises 401; session_label(request) ->
     owner id for a logged-in browser session or None (page images skip the API rate limit); log_activity(request,
@@ -111,6 +115,17 @@ def configure(get_repo, require_key=None, session_label=None, log_activity=None,
     global _get_repo, _require_key, _session_label, _log_activity, _session_payload
     _get_repo, _require_key, _session_label, _log_activity = get_repo, require_key, session_label, log_activity
     _session_payload = session_payload
+    global _owner_profile
+    _owner_profile = owner_profile          # owner id -> {"name", "email"} of the account (sender defaults)
+
+
+def _profile(owner) -> dict:
+    if _owner_profile is None:
+        return {}
+    try:
+        return _owner_profile(owner) or {}
+    except Exception:
+        return {}
 
 
 def _repo():
@@ -1725,8 +1740,15 @@ def create_envelope(body: EnvCreate, request: Request, caller: str = Depends(_wr
     env = _blank_env(caller, _clean(body.title, 200) or "Untitled envelope")
     env["message"] = _clean(body.message, 2000)
     env["signing_order"] = "parallel" if body.signing_order == "parallel" else "sequential"
-    env["sender_name"] = _clean(body.sender_name, 120)
-    _apply_sender_email(env, body.sender_email)
+    prof = _profile(caller)                 # default the sender to the signed-in person, not the product name
+    env["sender_name"] = _clean(body.sender_name, 120) or _clean(prof.get("name"), 120)
+    if body.sender_email is not None:
+        _apply_sender_email(env, body.sender_email)
+    elif prof.get("email"):
+        try:                                # the account email is a default only: never block creating the envelope
+            _apply_sender_email(env, prof["email"])
+        except HTTPException:
+            pass
     _apply_expiry(env, body.expires_at)
     eid = _repo().store_document(b"", "application/json", caller, "esign", copy.deepcopy(env), owner=caller)
     if not eid:
@@ -2142,7 +2164,7 @@ def send_envelope(eid: str, request: Request, body: Optional[NotifyIn] = None, c
             env["mail"] = {"on": True, "base": base}
         env["status"], env["sent_at"] = "sent", _now()
         if not env.get("sender_name"):
-            env["sender_name"] = brand.name()
+            env["sender_name"] = _clean(_profile(env["owner"]).get("name"), 120) or brand.name()
         for r in rs:
             r["status"], r["link_version"] = "pending", int(r.get("link_version") or 1)
         env["current_order"] = min(int(r.get("routing_order") or 1) for r in actors)
