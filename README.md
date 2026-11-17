@@ -4,6 +4,8 @@ Self-hosted e-signatures you can put your own name on. Send PDFs (or Word files)
 
 Apache-2.0. One Docker container. SQLite by default, Postgres if you want it.
 
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/sect0rial/daertho-esign)
+
 ## What it does
 
 - **Envelopes.** Upload up to 20 documents (PDF, PNG/JPEG, or Word/ODT/RTF, which are converted with LibreOffice). Add signers, CC and viewers, set a routing order, and drag fields onto the page: signature, initials, date signed, name, email, company, title, text, checkbox, date.
@@ -32,9 +34,11 @@ Open http://localhost:8000. The first visit asks you to create the admin account
 
 ## One-click hosting
 
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/sect0rial/daertho-esign)
+
 | Host | How |
 |---|---|
-| **Render** | Fork this repo, then *New → Blueprint* and pick your fork. `render.yaml` sets up the service, a 5 GB disk at `/data`, and a generated `ESIGN_SECRET`. Then set `ESIGN_PUBLIC_URL`. |
+| **Render** | Click the button above. Render reads `render.yaml`, creates the service with a 5 GB disk at `/data`, and generates `ESIGN_SECRET`. It asks you for `ESIGN_PUBLIC_URL` (your app's address, such as `https://your-app.onrender.com`) and, optionally, your brand name and an encryption key. The disk needs a paid plan (Starter or above). To run your own changes, fork the repo first and use *New → Blueprint* on your fork. |
 | **Railway** | *New project → Deploy from GitHub repo*. `railway.json` builds the Dockerfile. Add a **volume mounted at `/data`** and set `ESIGN_SECRET`, `ESIGN_PUBLIC_URL` and `ESIGN_TRUST_PROXY=1`. |
 | **Any VM** | Docker Compose as above, behind Caddy or nginx for HTTPS. Set `ESIGN_TRUST_PROXY=1`. |
 
