@@ -1,0 +1,17 @@
+# Runtime dependencies (tested on Python 3.12). Tests also need: pytest==9.2.0 httpx==0.28.1
+fastapi==0.163.1
+uvicorn==0.54.0
+python-multipart==0.0.34
+pypdf==7.1.0
+reportlab==5.1.0
+pypdfium2==5.15.2
+pillow==13.0.0
+cryptography==50.0.2
+pyhanko==0.38.1
+pyhanko-certvalidator==0.33.0
+asn1crypto==1.5.1
+certifi==2026.10.23
+psycopg[binary]==3.3.9
+anyascii==0.3.3
+python-bidi==0.6.12
+arabic-reshaper==3.1.0

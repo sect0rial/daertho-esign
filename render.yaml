@@ -1,0 +1,24 @@
+# One-click deploy to Render: https://render.com/deploy?repo=<your fork URL>
+services:
+  - type: web
+    name: daertho-esign
+    runtime: docker
+    plan: starter            # needs a paid plan for the persistent disk
+    healthCheckPath: /healthz
+    disk:
+      name: esign-data
+      mountPath: /data
+      sizeGB: 5
+    envVars:
+      - key: ESIGN_ENV
+        value: production
+      - key: ESIGN_SECRET
+        generateValue: true
+      - key: ESIGN_ENC_KEY
+        sync: false          # optional: paste a Fernet key to encrypt files at rest (see README)
+      - key: ESIGN_PUBLIC_URL
+        sync: false          # e.g. https://sign.yourcompany.com
+      - key: ESIGN_TRUST_PROXY
+        value: "1"
+      - key: ESIGN_BRAND_NAME
+        sync: false

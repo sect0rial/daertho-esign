@@ -1,0 +1,6 @@
+Daertho E-Sign
+Copyright 2026 Daertho
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+"Daertho" and the Daertho logo are trademarks of Daertho; the licence does not grant permission to use them
+(Apache-2.0 section 6). White-label deployments should set their own ESIGN_BRAND_* values.

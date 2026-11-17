@@ -1,0 +1,27 @@
+# Quick start:  cp .env.example .env  (set ESIGN_SECRET)  →  docker compose up -d  →  open http://localhost:8000
+services:
+  esign:
+    build: .
+    image: daertho-esign:latest
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - esign-data:/data
+
+  # Optional Postgres instead of the built-in SQLite file. Uncomment, then set in .env:
+  #   ESIGN_DATABASE_URL=postgresql://esign:change-me@db:5432/esign
+  # db:
+  #   image: postgres:16-alpine
+  #   restart: unless-stopped
+  #   environment:
+  #     POSTGRES_USER: esign
+  #     POSTGRES_PASSWORD: change-me
+  #     POSTGRES_DB: esign
+  #   volumes:
+  #     - pg-data:/var/lib/postgresql/data
+
+volumes:
+  esign-data:
+  # pg-data:
