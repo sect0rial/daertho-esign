@@ -1,4 +1,6 @@
 # Quick start:  cp .env.example .env  (set ESIGN_SECRET)  →  docker compose up -d  →  open http://localhost:8000
+# The first-run page asks for a setup token: ESIGN_SETUP_TOKEN from .env, or, if that is empty, the one in
+#   docker compose logs esign | grep "Setup token"
 services:
   esign:
     build: .

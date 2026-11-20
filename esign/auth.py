@@ -1,6 +1,8 @@
 """Accounts for the people who SEND envelopes (signers never need an account).
 
-- First run: while no user exists, POST /v1/auth/setup creates the first admin.
+- First run: while no user exists, POST /v1/auth/setup creates the first admin. It needs the setup token: the value
+  of ESIGN_SETUP_TOKEN, or (if that is unset) a random one written to the server log and to <data dir>/.setup-token.
+  Without it, whoever reached a fresh deployment first could make themselves the admin.
 - Browser sessions: a signed, HttpOnly cookie (HMAC-SHA256 over user id + session version + expiry with ESIGN_SECRET).
   Signing out everywhere / disabling a user bumps session_ver, which kills every cookie that user holds.
 - API keys: "dsk_" + 40 hex chars, sent as X-API-Key; only a SHA-256 of the key is stored.
@@ -14,7 +16,10 @@ import hmac
 import os
 import re
 import secrets
+import sys
+import threading
 import time
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException, Request, Response
@@ -31,6 +36,75 @@ _secret: bytes = b""
 def configure(store, secret: bytes):
     global _store, _secret
     _store, _secret = store, secret
+
+
+# ------------------------------------------------------------------------------------------------ first-run token
+SETUP_TOKEN_FILE = ".setup-token"
+SETUP_TOKEN_MIN = 16
+_setup_token: str = ""                               # empty = first-run setup over HTTP is refused
+_setup_token_file: Optional[Path] = None
+_setup_lock = threading.Lock()
+
+
+def pending_setup_token(data_dir) -> tuple:
+    """(token, source) while no user exists, else ("", ""). source is "env" (ESIGN_SETUP_TOKEN) or "file" (a random
+    token kept in <data dir>/.setup-token, created here if missing)."""
+    if _store.count_users() > 0:
+        return "", ""
+    env = (os.environ.get("ESIGN_SETUP_TOKEN") or "").strip()
+    if env:
+        if len(env) < SETUP_TOKEN_MIN:
+            sys.exit(f"ESIGN_SETUP_TOKEN must be at least {SETUP_TOKEN_MIN} characters (try: openssl rand -hex 16)")
+        return env, "env"
+    f = Path(data_dir) / SETUP_TOKEN_FILE
+    try:
+        tok = f.read_text().strip()
+    except OSError:
+        tok = ""
+    if len(tok) < SETUP_TOKEN_MIN:
+        tok = secrets.token_hex(16)
+        fd = os.open(f, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(tok + "\n")
+        f.chmod(0o600)
+    return tok, "file"
+
+
+def init_setup_token(data_dir) -> None:
+    """Called once at start-up. On a fresh deployment this decides the token POST /v1/auth/setup must carry and tells
+    the operator (and nobody else) where to find it: the server log."""
+    global _setup_token, _setup_token_file
+    _setup_token_file = Path(data_dir) / SETUP_TOKEN_FILE
+    _setup_token, source = pending_setup_token(data_dir)
+    if not _setup_token:
+        _forget_setup_token()
+        return
+    line = "=" * 78
+    print(line)
+    print("First run: no admin account exists yet. The first-run page asks for a setup token.")
+    if source == "env":
+        print("Setup token: the value of ESIGN_SETUP_TOKEN in this server's environment.")
+    else:
+        print("Setup token: " + _setup_token)
+        print(f"(also saved in {_setup_token_file}; set ESIGN_SETUP_TOKEN to choose your own)")
+    print(line, flush=True)
+
+
+def _forget_setup_token() -> None:
+    global _setup_token
+    _setup_token = ""
+    try:
+        if _setup_token_file is not None:
+            _setup_token_file.unlink()
+    except OSError:
+        pass
+
+
+def _setup_token_ok(supplied: str) -> bool:
+    supplied = (supplied or "").strip()
+    if not _setup_token or not supplied:
+        return False
+    return hmac.compare_digest(supplied.encode(), _setup_token.encode())
 
 
 # ------------------------------------------------------------------------------------------------ passwords
@@ -179,6 +253,7 @@ class Creds(BaseModel):
 
 class SetupIn(Creds):
     name: str = Field("", max_length=120)
+    setup_token: str = Field("", max_length=200)
 
 
 class UserIn(BaseModel):
@@ -215,9 +290,18 @@ def setup(body: SetupIn, request: Request, response: Response):
     _throttle("setup:" + _ip(request), 10)
     if _store.count_users() > 0:
         raise HTTPException(status_code=409, detail="Setup is already done — sign in instead.")
+    if not _setup_token_ok(body.setup_token):
+        raise HTTPException(status_code=403, detail="That setup token isn't right. It is the ESIGN_SETUP_TOKEN "
+                                                    "setting of this server, or the token in its start-up log.")
     if len(body.password) < 10:
         raise HTTPException(status_code=422, detail="Use a password of at least 10 characters.")
-    u = _store.create_user(_norm_email(body.email), body.name.strip(), "admin", hash_pw(body.password))
+    email, pw_hash = _norm_email(body.email), hash_pw(body.password)
+    with _setup_lock:                                # the "is it still empty?" check and the insert are one step
+        u = _store.create_first_admin(email, body.name.strip(), pw_hash)
+        if u:
+            _forget_setup_token()
+    if not u:
+        raise HTTPException(status_code=409, detail="Setup is already done — sign in instead.")
     _set_cookie(response, request, u)
     return {"user": _public(u)}
 

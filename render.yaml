@@ -14,6 +14,8 @@ services:
         value: production
       - key: ESIGN_SECRET
         generateValue: true
+      - key: ESIGN_SETUP_TOKEN
+        generateValue: true  # the first-run page asks for it: copy it from the service's Environment page
       - key: ESIGN_ENC_KEY
         sync: false          # optional: paste a Fernet key to encrypt files at rest (see README)
       - key: ESIGN_PUBLIC_URL

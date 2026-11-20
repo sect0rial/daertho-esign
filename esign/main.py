@@ -45,6 +45,7 @@ def _secret() -> bytes:
 SECRET = _secret()
 STORE = store.open_store()
 auth.configure(STORE, SECRET)
+auth.init_setup_token(store.data_dir())             # fresh deployment: the first-run page needs this token
 
 
 def _log_activity(request, event_type, caller, payload=None, response=None):

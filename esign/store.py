@@ -133,6 +133,16 @@ class _Base:
                    (uid, email, name, role, pw_hash, _now()))
         return self.get_user(uid)
 
+    def create_first_admin(self, email, name, pw_hash) -> Optional[dict]:
+        """The first-run admin: inserted only while the user table is empty, as ONE statement, so two first-run
+        requests arriving together cannot both succeed. None = somebody already exists."""
+        uid = uuid.uuid4().hex[:16]
+        with self._lock:
+            n = self._exec(self._q(f"INSERT INTO app_user ({self._UCOLS}) SELECT ?,?,?,?,?,?,0,1 "
+                                   "WHERE NOT EXISTS (SELECT 1 FROM app_user)"),
+                           (uid, email, name, "admin", pw_hash, _now()), "count")
+        return self.get_user(uid) if n else None
+
     def get_user(self, uid):
         return self._user(self._exec(self._q(f"SELECT {self._UCOLS} FROM app_user WHERE id=?"), (uid,), "one"))
 

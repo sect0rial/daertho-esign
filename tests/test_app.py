@@ -7,11 +7,15 @@ import pytest
 from fastapi.testclient import TestClient
 
 
+SETUP_TOKEN = "setup-token-for-tests-0123456789"
+
+
 @pytest.fixture()
 def app_client(tmp_path, monkeypatch):
     monkeypatch.setenv("ESIGN_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("ESIGN_SECRET", "t" * 64)
     monkeypatch.setenv("ESIGN_TSA_URLS", "off")
+    monkeypatch.setenv("ESIGN_SETUP_TOKEN", SETUP_TOKEN)
     monkeypatch.delenv("ESIGN_DATABASE_URL", raising=False)
     monkeypatch.setenv("ESIGN_BRAND_NAME", "Acme Sign")
     monkeypatch.setenv("ESIGN_BRAND_ACCENT", "#ff0066")
@@ -22,7 +26,7 @@ def app_client(tmp_path, monkeypatch):
 
 
 def _setup(c, email="admin@example.com", pw="correct horse battery"):
-    r = c.post("/v1/auth/setup", json={"email": email, "password": pw, "name": "Ada"})
+    r = c.post("/v1/auth/setup", json={"email": email, "password": pw, "name": "Ada", "setup_token": SETUP_TOKEN})
     assert r.status_code == 200, r.text
     return r.json()["user"]
 
@@ -54,7 +58,8 @@ def test_first_run_setup_then_locked(app_client):
     assert u["role"] == "admin"
     me = c.get("/v1/auth/me").json()
     assert me["user"]["email"] == "admin@example.com" and me["setup_needed"] is False
-    r = c.post("/v1/auth/setup", json={"email": "x@example.com", "password": "another long pw"})
+    r = c.post("/v1/auth/setup", json={"email": "x@example.com", "password": "another long pw",
+                                       "setup_token": SETUP_TOKEN})
     assert r.status_code == 409
 
 

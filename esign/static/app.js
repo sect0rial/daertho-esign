@@ -1,7 +1,8 @@
 /*! Daertho E-Sign — owner app shell (vanilla JS, no dependencies).
  *
  *  Boot: GET /v1/brand (name, logo) and GET /v1/auth/me → {user:{id,email,name,role}|null, setup_needed:bool}.
- *    - setup_needed  → first-run form (POST /v1/auth/setup) creates the first admin
+ *    - setup_needed  → first-run form (POST /v1/auth/setup) creates the first admin; it asks for the setup token
+ *                      (ESIGN_SETUP_TOKEN, or the one in the server's start-up log)
  *    - no user       → sign-in form (POST /v1/auth/login)
  *    - signed in     → top bar + the envelope app (window.ESign, esign.js) mounted full-page
  *  Routes (hash): #envelopes (default) · #envelope/<id> · #verify · #settings
@@ -155,22 +156,26 @@
   function renderSetup() {
     clear(root);
     document.title = 'Set up — ' + brandName();
+    var tk = inputField('Setup token', { type: 'password', autocomplete: 'off', required: true, maxlength: '200', spellcheck: 'false' });
+    var tkHint = h('p', { class: 'app-hint', text: 'Proves this is your server. It is the ESIGN_SETUP_TOKEN setting in your hosting dashboard or .env file. If you did not set one, the server wrote a token to its start-up log.' });
+    tk.wrap.appendChild(tkHint);
     var nm = inputField('Your name', { type: 'text', autocomplete: 'name', maxlength: '120' });
     var em = inputField('Email', { type: 'email', autocomplete: 'username', required: true, maxlength: '254' });
     var pw = inputField('Password (10 characters or more)', { type: 'password', autocomplete: 'new-password', required: true, minlength: '10', maxlength: '200' });
     var pw2 = inputField('Repeat the password', { type: 'password', autocomplete: 'new-password', required: true, maxlength: '200' });
     var err = h('p', { class: 'app-err', role: 'alert' });
     var btn = h('button', { type: 'submit', class: 'app-btn app-btn-p app-btn-block', text: 'Create admin account' });
-    var form = h('form', { class: 'app-form', novalidate: true }, nm.wrap, em.wrap, pw.wrap, pw2.wrap, err, btn);
+    var form = h('form', { class: 'app-form', novalidate: true }, tk.wrap, nm.wrap, em.wrap, pw.wrap, pw2.wrap, err, btn);
     form.addEventListener('submit', function (e) {
       e.preventDefault();
       err.textContent = '';
       var email = em.input.value.trim();
+      if (!tk.input.value.trim()) { err.textContent = 'Enter the setup token.'; tk.input.focus(); return; }
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) { err.textContent = 'Enter a valid email address.'; em.input.focus(); return; }
       if (pw.input.value.length < 10) { err.textContent = 'Use a password of at least 10 characters.'; pw.input.focus(); return; }
       if (pw.input.value !== pw2.input.value) { err.textContent = 'The passwords don’t match.'; pw2.input.focus(); return; }
       btn.disabled = true; btn.textContent = 'Creating…';
-      api('POST', '/v1/auth/setup', { email: email, password: pw.input.value, name: nm.input.value.trim() }).then(function () {
+      api('POST', '/v1/auth/setup', { email: email, password: pw.input.value, name: nm.input.value.trim(), setup_token: tk.input.value.trim() }).then(function () {
         return api('GET', '/v1/auth/me');
       }).then(function (m) {
         if (m && m.user) { ME = m.user; startApp(); }
@@ -179,11 +184,12 @@
         btn.disabled = false; btn.textContent = 'Create admin account';
         err.textContent = e2.status === 409 ? 'This server is already set up. Sign in instead.' : e2.message;
         if (e2.status === 409) setTimeout(renderLogin, 1500);
+        if (e2.status === 403) { tk.input.focus(); tk.input.select(); }
       });
     });
     root.appendChild(authShell('Set up ' + brandName(), [
       h('p', { class: 'app-p', text: 'Create the first administrator account. You can add more people afterwards in Settings.' }), form]));
-    (nm.input).focus();
+    (tk.input).focus();
   }
 
   /* ---------------------------------------------------------------- signed-in app */

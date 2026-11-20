@@ -81,4 +81,6 @@ def _isolated_env(monkeypatch, tmp_path):
     monkeypatch.setenv("ESIGN_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("ESIGN_PKI_AUTO", "0")
     monkeypatch.setenv("ESIGN_SECRET", "test-secret")
+    from esign import auth
+    auth._hits.clear()                              # sign-in / setup throttles count per process, not per test
     yield

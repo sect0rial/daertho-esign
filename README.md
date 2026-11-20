@@ -30,7 +30,13 @@ Set `ESIGN_SECRET` (run `openssl rand -hex 32`) and `ESIGN_PUBLIC_URL` in `.env`
 docker compose up -d
 ```
 
-Open http://localhost:8000. The first visit asks you to create the admin account.
+Open http://localhost:8000. The first visit asks you to create the admin account, and for a **setup token** that proves the server is yours. Set `ESIGN_SETUP_TOKEN` in `.env` to choose it. If you leave it empty, the server makes one up and writes it to its log at start-up:
+
+```bash
+docker compose logs esign | grep "Setup token"
+```
+
+The token is only used once. After the admin account exists, first-run setup is closed for good.
 
 ## One-click hosting
 
@@ -38,8 +44,8 @@ Open http://localhost:8000. The first visit asks you to create the admin account
 
 | Host | How |
 |---|---|
-| **Render** | Click the button above. Render reads `render.yaml`, creates the service with a 5 GB disk at `/data`, and generates `ESIGN_SECRET`. It asks you for `ESIGN_PUBLIC_URL` (your app's address, such as `https://your-app.onrender.com`) and, optionally, your brand name and an encryption key. The disk needs a paid plan (Starter or above). To run your own changes, fork the repo first and use *New → Blueprint* on your fork. |
-| **Railway** | *New project → Deploy from GitHub repo*. `railway.json` builds the Dockerfile. Add a **volume mounted at `/data`** and set `ESIGN_SECRET`, `ESIGN_PUBLIC_URL` and `ESIGN_TRUST_PROXY=1`. |
+| **Render** | Click the button above. Render reads `render.yaml`, creates the service with a 5 GB disk at `/data`, and generates `ESIGN_SECRET` and `ESIGN_SETUP_TOKEN`. It asks you for `ESIGN_PUBLIC_URL` (your app's address, such as `https://your-app.onrender.com`) and, optionally, your brand name and an encryption key. The disk needs a paid plan (Starter or above). When the app is up, copy `ESIGN_SETUP_TOKEN` from the service's *Environment* page in the Render dashboard: the first-run page asks for it before it creates your admin account. To run your own changes, fork the repo first and use *New → Blueprint* on your fork. |
+| **Railway** | *New project → Deploy from GitHub repo*. `railway.json` builds the Dockerfile. Add a **volume mounted at `/data`** and set `ESIGN_SECRET`, `ESIGN_PUBLIC_URL` and `ESIGN_TRUST_PROXY=1` under *Variables*. Also set `ESIGN_SETUP_TOKEN` there to a long random string (`openssl rand -hex 16`) and type it on the first-run page. If you leave it out, copy the token the app prints in its deploy log. |
 | **Any VM** | Docker Compose as above, behind Caddy or nginx for HTTPS. Set `ESIGN_TRUST_PROXY=1`. |
 
 Run **one** instance with **one** worker. Envelope edits are serialised in-process. (With Postgres, a single instance is still the supported setup.)
@@ -52,6 +58,7 @@ Everything is an environment variable. `.env.example` lists all of them with com
 |---|---|
 | `ESIGN_SECRET` | Signs sessions and signing links. Required in production. Changing it signs everyone out and invalidates every unsigned link. |
 | `ESIGN_PUBLIC_URL` | The address people reach the app on. Used in emailed links. |
+| `ESIGN_SETUP_TOKEN` | Asked for once, on the first-run page, before the first admin account is created (16 characters or more). If unset, a random token is written to the server log and to `ESIGN_DATA_DIR/.setup-token`. It has no use after setup. |
 | `ESIGN_DATABASE_URL` | Empty means SQLite in `ESIGN_DATA_DIR`. `postgresql://…` means Postgres. |
 | `ESIGN_ENC_KEY` | Optional Fernet key that encrypts every stored file. **Back it up**: lose it and the files are gone. |
 | `ESIGN_MAIL`, `ESIGN_SMTP_*` | Turn on emailed links (any SMTP provider: SES, Postmark, Resend, Google Workspace, Mailgun…). |
@@ -86,6 +93,12 @@ docker compose exec esign python -m esign.cli create-admin you@example.com
 docker compose exec esign python -m esign.cli reset-password you@example.com
 ```
 
+On a fresh install, this prints the setup token the first-run page asks for:
+
+```bash
+docker compose exec esign python -m esign.cli setup-token
+```
+
 ## Development
 
 ```bash
@@ -99,6 +112,12 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ```bash
 .venv/bin/pytest -q
 ```
+
+## Upgrading
+
+Changes that need a moment of your attention when you pull a newer version:
+
+- **First-run setup needs a token.** `POST /v1/auth/setup` now answers 403 without the setup token (`setup_token` in the JSON body). Before this, the first visitor to a fresh deployment could create the admin account. Servers that already have an account are not affected. For a new one, set `ESIGN_SETUP_TOKEN` or read the token from the start-up log.
 
 ## Security
 
