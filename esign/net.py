@@ -25,14 +25,51 @@ def client_ip(request) -> str:
     CF-Connecting-IP header the client could have sent itself. Otherwise the TCP peer address."""
     if request is None:
         return ""
+    try:
+        peer = (request.client.host if request.client else "") or ""
+    except Exception:
+        peer = ""
+    forwarded = request.headers.get("x-forwarded-for") or ""
     if trust_proxy():
-        xff = (request.headers.get("x-forwarded-for") or "").split(",")[-1].strip()
+        xff = forwarded.split(",")[-1].strip()
         if xff and _ADDR.match(xff):
             return xff
+        if not forwarded:
+            _warn_once("direct", "WARNING: ESIGN_TRUST_PROXY=1, but a request arrived without X-Forwarded-For, so it "
+                                 "did not come through your proxy. If the app's port can be reached directly, visitors "
+                                 "can forge the IP address recorded as evidence: close the port to everything but the "
+                                 "proxy, or set ESIGN_TRUST_PROXY=0.")
+    elif forwarded and _is_private(peer):
+        _warn_once("proxied", "WARNING: requests are arriving through a proxy (X-Forwarded-For is set and the "
+                              f"connection comes from {peer}), but ESIGN_TRUST_PROXY is not 1. Every visitor is "
+                              "recorded with the proxy's address and shares one rate limit. If the app is reachable "
+                              "only through that proxy, set ESIGN_TRUST_PROXY=1.")
+    return peer
+
+
+_warned: set = set()
+
+
+def _warn_once(what: str, text: str) -> None:
+    if what not in _warned:
+        _warned.add(what)
+        print(text, flush=True)
+
+
+_INTERNAL = [ipaddress.ip_network(n) for n in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16", "100.64.0.0/10",
+    "::1/128", "fc00::/7", "fe80::/10")]
+
+
+def _is_private(ip: str) -> bool:
+    """An address a reverse proxy on the same machine or network would connect from."""
     try:
-        return (request.client.host if request.client else "") or ""
-    except Exception:
-        return ""
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    if a.version == 6 and a.ipv4_mapped:
+        a = a.ipv4_mapped
+    return any(a in n for n in _INTERNAL if n.version == a.version)
 
 
 def limit_key(ip: str) -> str:

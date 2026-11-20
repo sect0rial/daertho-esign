@@ -46,7 +46,7 @@ The token is only used once. After the admin account exists, first-run setup is 
 |---|---|
 | **Render** | Click the button above. Render reads `render.yaml`, creates the service with a 5 GB disk at `/data`, and generates `ESIGN_SECRET` and `ESIGN_SETUP_TOKEN`. It asks you for `ESIGN_PUBLIC_URL` (your app's address, such as `https://your-app.onrender.com`) and, optionally, your brand name and an encryption key. The disk needs a paid plan (Starter or above). When the app is up, copy `ESIGN_SETUP_TOKEN` from the service's *Environment* page in the Render dashboard: the first-run page asks for it before it creates your admin account. To run your own changes, fork the repo first and use *New → Blueprint* on your fork. |
 | **Railway** | *New project → Deploy from GitHub repo*. `railway.json` builds the Dockerfile. Add a **volume mounted at `/data`** and set `ESIGN_SECRET`, `ESIGN_PUBLIC_URL` and `ESIGN_TRUST_PROXY=1` under *Variables*. Also set `ESIGN_SETUP_TOKEN` there to a long random string (`openssl rand -hex 16`) and type it on the first-run page. If you leave it out, copy the token the app prints in its deploy log. |
-| **Any VM** | Docker Compose as above, behind Caddy or nginx for HTTPS. Set `ESIGN_TRUST_PROXY=1`. |
+| **Any VM** | Docker Compose as above, behind Caddy or nginx for HTTPS. Set `ESIGN_TRUST_PROXY=1` (see [Behind a reverse proxy](#behind-a-reverse-proxy)). |
 
 Run **one** instance with **one** worker. Envelope edits are serialised in-process. (With Postgres, a single instance is still the supported setup.)
 
@@ -59,6 +59,7 @@ Everything is an environment variable. `.env.example` lists all of them with com
 | `ESIGN_SECRET` | Signs sessions and signing links. Required in production. Changing it signs everyone out and invalidates every unsigned link. |
 | `ESIGN_PUBLIC_URL` | The address people reach the app on. Used in emailed links. |
 | `ESIGN_SETUP_TOKEN` | Asked for once, on the first-run page, before the first admin account is created (16 characters or more). If unset, a random token is written to the server log and to `ESIGN_DATA_DIR/.setup-token`. It has no use after setup. |
+| `ESIGN_TRUST_PROXY` | `0` (default): a visitor's IP is the address of the connection. `1`: it is the last `X-Forwarded-For` entry. Use `1` only when the app is reachable solely through your own proxy or your host's router. |
 | `ESIGN_DATABASE_URL` | Empty means SQLite in `ESIGN_DATA_DIR`. `postgresql://…` means Postgres. |
 | `ESIGN_ENC_KEY` | Optional Fernet key that encrypts every stored file. **Back it up**: lose it and the files are gone. |
 | `ESIGN_MAIL`, `ESIGN_SMTP_*` | Turn on emailed links (any SMTP provider: SES, Postmark, Resend, Google Workspace, Mailgun…). |
@@ -66,6 +67,20 @@ Everything is an environment variable. `.env.example` lists all of them with com
 | `ESIGN_TSA_URLS` | Timestamp servers. Defaults to free public ones. `off` disables timestamping. |
 | `ESIGN_MAX_BODY_MB`, `ESIGN_VERIFY_MAX_MB` | Request-size limits, in megabytes (see below). Defaults: 8 and 500. |
 | `ESIGN_BRAND_*` | Name, legal name, logo URL, accent/background/ink colours, Google Font families, support email, and whether to hide "Powered by". |
+
+### Behind a reverse proxy
+
+The signer's IP address is part of the evidence: it is printed on the Certificate of Completion and written into the audit trail. The rate limits count by it too. So the app has to know which address to believe.
+
+- **Nothing in front of the app** (`ESIGN_TRUST_PROXY=0`, the default): the address is the TCP connection's. `X-Forwarded-For` is ignored.
+- **Your proxy or your host's router in front** (`ESIGN_TRUST_PROXY=1`): the address is the last `X-Forwarded-For` entry, the one your proxy appended. Entries to its left come from the client and are ignored. This is the right setting on Render and Railway, and behind Caddy or nginx.
+
+Two ways to get it wrong:
+
+- `1` while the port is also reachable directly. A signer can then send the header and choose the address recorded as evidence, and step around the per-address limits. This is why `docker-compose.yml` publishes the port on `127.0.0.1` only: the proxy on the same machine can reach it and nobody else can.
+- `0` behind a proxy. Every visitor then looks like the proxy: certificates show the proxy's address, and everyone shares one rate-limit bucket.
+
+The app writes a warning to its log when requests look like either case.
 
 ### Request-size limits
 
@@ -133,6 +148,7 @@ Changes that need a moment of your attention when you pull a newer version:
 
 - **First-run setup needs a token.** `POST /v1/auth/setup` now answers 403 without the setup token (`setup_token` in the JSON body). Before this, the first visitor to a fresh deployment could create the admin account. Servers that already have an account are not affected. For a new one, set `ESIGN_SETUP_TOKEN` or read the token from the start-up log.
 - **Sign-in limits count by the real client address.** With `ESIGN_TRUST_PROXY=1` the sign-in and first-run limits now use the last `X-Forwarded-For` hop (the one your proxy wrote), the same rule the signer evidence already used. Before this they used the first hop, which the client controls. Wrong passwords are now counted per account *and* address (10 in 15 minutes), so somebody who knows a user's email can no longer lock that user out. Nothing to change in your settings, but check that your proxy really is the only way to reach the app.
+- **`ESIGN_TRUST_PROXY` now defaults to off in `.env.example`, and Compose publishes the port on `127.0.0.1` only.** Your existing `.env` is not touched, so a running install behaves as before. If you pull the new `docker-compose.yml` and reached the app directly on port 8000 from other machines, either put a proxy in front (recommended) or change the port line back to `"8000:8000"`. If the app is behind a proxy, keep `ESIGN_TRUST_PROXY=1`. If it is not, set it to `0`: with `1` and no proxy, signers can forge the IP address on the certificate.
 - **Request-size limits.** Requests above the limits in [Request-size limits](#request-size-limits) now get 413 before they are read, and an upload to an owner route gets 401 before it is read if the caller isn't signed in. If you post JSON bodies above 8 MB to the API, raise `ESIGN_MAX_BODY_MB`.
 
 ## Security

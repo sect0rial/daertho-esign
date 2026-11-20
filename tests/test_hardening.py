@@ -1,12 +1,16 @@
-"""Deployment hardening: the first-run setup token, sign-in limits that count by the real client address, and
-request-body limits that apply before an upload is read."""
+"""Deployment hardening: the first-run setup token, sign-in limits that count by the real client address, 
+request-body limits that apply before an upload is read, and shipped defaults that don't trust forwarded headers."""
 import asyncio
 import importlib
 import sys
+import re
 import threading
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+
+ROOT = Path(__file__).resolve().parents[1]
 
 TOKEN = "setup-token-for-tests-0123456789"
 ADMIN = {"email": "admin@example.com", "password": "correct horse battery", "name": "Ada"}
@@ -363,3 +367,49 @@ def test_sign_in_is_checked_before_the_body_is_read():
     assert _run_middleware(MB, [b"a" * 10] * 3, chunked, True, refuse) == (401, 0, 3)
     assert _run_middleware(MB, [b"a" * 10] * 3, chunked, True, lambda request: None) == (200, 30, 0)
     assert _run_middleware(MB, [b""], [], True, refuse)[0] == 200    # no body: the route does its own check
+
+
+# ------------------------------------------------------------------------------------------- shipped defaults
+def test_shipped_defaults_do_not_trust_forwarded_headers():
+    """The quick start (cp .env.example .env; docker compose up) must not let a signer pick the IP on the certificate:
+    proxy trust is off unless the deployer turns it on, and the port is published on this machine only."""
+    env = (ROOT / ".env.example").read_text()
+    assert re.findall(r"^ESIGN_TRUST_PROXY=(.*)$", env, re.M) == ["0"]
+    compose = (ROOT / "docker-compose.yml").read_text()
+    ports = re.findall(r'^\s*-\s*"?([0-9.:]+:8000)"?\s*$', compose, re.M)
+    assert ports and all(p.startswith("127.0.0.1:") for p in ports)
+    render = (ROOT / "render.yaml").read_text()                         # Render's router is always in front
+    assert re.search(r"key: ESIGN_TRUST_PROXY\s*\n\s*value: \"1\"", render)
+
+
+def _req(xff=None, peer="192.0.2.10"):
+    from starlette.requests import Request
+    headers = [(b"x-forwarded-for", xff.encode())] if xff else []
+    return Request({"type": "http", "headers": headers, "client": (peer, 1234)})
+
+
+def test_forwarded_header_is_ignored_by_default(monkeypatch):
+    from esign import esign as E
+    assert E._ip(_req("198.51.100.99")) == "192.0.2.10"                 # ESIGN_TRUST_PROXY unset
+    monkeypatch.setenv("ESIGN_TRUST_PROXY", "0")
+    assert E._ip(_req("198.51.100.99")) == "192.0.2.10"
+    monkeypatch.setenv("ESIGN_TRUST_PROXY", "true")                     # only the documented "1" turns it on
+    assert E._ip(_req("198.51.100.99")) == "192.0.2.10"
+
+
+def test_warns_once_when_the_proxy_setting_looks_wrong(monkeypatch, capsys):
+    from esign import net
+    monkeypatch.setattr(net, "_warned", set())
+    net.client_ip(_req("198.51.100.99", peer="203.0.113.50"))           # public peer sending the header: no proxy
+    assert capsys.readouterr().out == ""
+    net.client_ip(_req("198.51.100.99", peer="172.18.0.1"))             # behind a proxy, trust is off
+    net.client_ip(_req("198.51.100.98", peer="172.18.0.1"))
+    out = capsys.readouterr().out
+    assert out.count("WARNING") == 1 and "ESIGN_TRUST_PROXY=1" in out
+    monkeypatch.setenv("ESIGN_TRUST_PROXY", "1")
+    net.client_ip(_req("198.51.100.99, 203.0.113.7", peer="172.18.0.1"))   # as it should be: quiet
+    assert capsys.readouterr().out == ""
+    net.client_ip(_req(None, peer="203.0.113.50"))                      # trust is on, but this came in directly
+    net.client_ip(_req(None, peer="203.0.113.51"))
+    out = capsys.readouterr().out
+    assert out.count("WARNING") == 1 and "ESIGN_TRUST_PROXY=0" in out

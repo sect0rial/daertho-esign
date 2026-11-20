@@ -7,8 +7,11 @@ services:
     image: daertho-esign:latest
     restart: unless-stopped
     env_file: .env
+    # Published on this machine only. Put a reverse proxy with HTTPS in front (Caddy, nginx) and set
+    # ESIGN_TRUST_PROXY=1 in .env so the app records the visitor's address instead of the proxy's.
+    # To publish the port directly instead, use "8000:8000" and leave ESIGN_TRUST_PROXY=0.
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     volumes:
       - esign-data:/data
 
