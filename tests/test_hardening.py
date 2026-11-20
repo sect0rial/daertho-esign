@@ -1,5 +1,6 @@
 """Deployment hardening: the first-run setup token, sign-in limits that count by the real client address, 
-request-body limits that apply before an upload is read, and shipped defaults that don't trust forwarded headers."""
+request-body limits that apply before an upload is read, shipped defaults that don't trust forwarded headers, and
+smaller items (sign-out, password change, encryption key, response headers, API docs switch)."""
 import asyncio
 import importlib
 import sys
@@ -413,3 +414,123 @@ def test_warns_once_when_the_proxy_setting_looks_wrong(monkeypatch, capsys):
     net.client_ip(_req(None, peer="203.0.113.51"))
     out = capsys.readouterr().out
     assert out.count("WARNING") == 1 and "ESIGN_TRUST_PROXY=0" in out
+
+
+# ------------------------------------------------------------------------------------------- sessions
+def test_sign_out_ends_the_session_on_the_server(start):
+    c = _signed_in(start)
+    other = TestClient(c.app, base_url="http://testserver")              # the same person on a second device
+    assert other.post("/v1/auth/login", json={"email": ADMIN["email"], "password": ADMIN["password"]}).status_code == 200
+    copied = c.cookies.get("esign_session")
+    assert copied.count(".") == 4
+    assert c.post("/v1/auth/logout").status_code == 200
+    thief = TestClient(c.app, base_url="http://testserver")              # somebody who kept a copy of the cookie
+    thief.cookies.set("esign_session", copied)
+    assert thief.get("/v1/auth/me").json()["user"] is None
+    assert thief.get("/v1/esign/envelopes").status_code == 401
+    assert other.get("/v1/auth/me").json()["user"]["email"] == ADMIN["email"]   # only that one session ended
+
+
+def test_cookies_issued_before_sessions_had_an_id_still_work_and_can_be_signed_out(start):
+    import time
+    from esign import auth
+    c = _signed_in(start)
+    uid = c.get("/v1/auth/me").json()["user"]["id"]
+    c.cookies.clear()
+    msg = f"{uid}.1.{int(time.time()) + 3600}"
+    old = msg + "." + auth._sign(msg)                                    # the four-part format of earlier versions
+    c.cookies.set("esign_session", old)
+    assert c.get("/v1/auth/me").json()["user"]["id"] == uid
+    assert c.post("/v1/auth/logout").status_code == 200
+    c.cookies.set("esign_session", old)
+    assert c.get("/v1/auth/me").json()["user"] is None
+    expired = f"{uid}.1.{int(time.time()) - 5}"
+    c.cookies.set("esign_session", expired + "." + auth._sign(expired))
+    assert c.get("/v1/auth/me").json()["user"] is None
+
+
+def test_password_change_limits_wrong_current_passwords(start):
+    c = _signed_in(start)
+    body = {"current": "not my password", "new": "a brand new password"}
+    assert [c.post("/v1/auth/password", json=body).status_code for _ in range(10)] == [401] * 10
+    assert c.post("/v1/auth/password", json={**body, "current": ADMIN["password"]}).status_code == 429
+
+
+def test_password_change_still_works_and_resets_the_count(start):
+    c = _signed_in(start)
+    body = {"current": "not my password", "new": "a brand new password"}
+    assert [c.post("/v1/auth/password", json=body).status_code for _ in range(4)] == [401] * 4
+    assert c.post("/v1/auth/password", json={**body, "current": ADMIN["password"]}).status_code == 200
+    assert [c.post("/v1/auth/password", json=body).status_code for _ in range(9)] == [401] * 9
+
+
+# ------------------------------------------------------------------------------------------- encryption key
+def test_bad_encryption_key_refuses_to_start(monkeypatch, tmp_path):
+    with pytest.raises(SystemExit) as e:
+        _load_app(monkeypatch, tmp_path, ESIGN_SETUP_TOKEN=TOKEN, ESIGN_ENC_KEY="not-a-fernet-key")
+    assert "ESIGN_ENC_KEY" in str(e.value)
+
+
+def test_bad_encryption_key_never_stores_a_file_unencrypted(monkeypatch):
+    from cryptography.fernet import Fernet
+    from conftest import build_memory_repo
+    from esign import esign as E
+    repo = build_memory_repo()
+    monkeypatch.setattr(E, "_get_repo", lambda: repo)
+    monkeypatch.setenv("ESIGN_ENC_KEY", "not-a-fernet-key")
+    with pytest.raises(E.EncKeyError):
+        E._put_blob("u:1", "0" * 32, "original", b"%PDF-secret", "application/pdf")
+    assert repo._docs == {}
+    monkeypatch.setenv("ESIGN_ENC_KEY", Fernet.generate_key().decode())
+    bid = E._put_blob("u:1", "0" * 32, "original", b"%PDF-secret", "application/pdf")
+    assert b"%PDF-secret" not in repo._docs[bid]["data"] and repo._docs[bid]["content_type"].endswith("+fernet")
+    monkeypatch.delenv("ESIGN_ENC_KEY")
+    assert E._enc_key() is None                                          # unset = encryption simply off
+
+
+# ------------------------------------------------------------------------------------------- headers, docs
+def _directive(csp, name):
+    return next((d.strip() for d in csp.split(";") if d.strip().startswith(name + " ")), "")
+
+
+def test_owner_app_has_a_content_security_policy(start):
+    r = start().get("/")
+    assert r.status_code == 200
+    csp = r.headers["content-security-policy"]
+    assert _directive(csp, "script-src") == "script-src 'self'"          # no inline, no third-party script
+    assert _directive(csp, "default-src") == "default-src 'self'"
+    assert _directive(csp, "frame-ancestors") == "frame-ancestors 'none'"
+    assert _directive(csp, "object-src") == "object-src 'none'" and _directive(csp, "base-uri") == "base-uri 'none'"
+    html = r.text
+    assert "<script>" not in html and " onclick=" not in html            # the page itself obeys it
+
+
+def test_api_docs_can_be_switched_off(start):
+    c = start()
+    assert c.get("/api/docs").status_code == 200 and c.get("/openapi.json").status_code == 200
+    c = start(ESIGN_API_DOCS="0")
+    assert c.get("/api/docs").status_code == 404 and c.get("/openapi.json").status_code == 404
+    assert c.get("/healthz").status_code == 200
+
+
+def test_session_cookie_is_secure_behind_a_tls_proxy(start):
+    setup = {**ADMIN, "setup_token": TOKEN}
+    c = start(ESIGN_TRUST_PROXY="1")
+    r = c.post("/v1/auth/setup", json=setup, headers={"X-Forwarded-For": PROXY, "X-Forwarded-Proto": "https"})
+    cookie = r.headers["set-cookie"].lower()
+    assert r.status_code == 200 and "secure" in cookie and "httponly" in cookie and "samesite=lax" in cookie
+    assert "strict-transport-security" in r.headers
+
+
+def test_forwarded_proto_is_not_believed_without_trust_proxy(start):
+    c = start()
+    r = c.post("/v1/auth/setup", json={**ADMIN, "setup_token": TOKEN}, headers={"X-Forwarded-Proto": "https"})
+    assert r.status_code == 200 and "secure" not in r.headers["set-cookie"].lower()
+    assert "strict-transport-security" not in r.headers
+
+
+def test_postgres_pool_is_a_listed_dependency():
+    """store.py imports psycopg_pool for ESIGN_DATABASE_URL=postgresql://...: it has to be installed with the rest."""
+    reqs = (ROOT / "requirements.txt").read_text()
+    assert "psycopg_pool" in (ROOT / "esign" / "store.py").read_text()
+    assert re.search(r"^psycopg-pool==\d", reqs, re.M)

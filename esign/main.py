@@ -19,7 +19,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import auth, brand, esign, esign_pdf, limits, store
+from . import auth, brand, esign, esign_pdf, limits, net, store
 
 STATIC = Path(__file__).resolve().parent / "static"
 VERSION = "0.1.0"
@@ -62,6 +62,11 @@ def _owner_profile(owner: str) -> dict:
 esign.configure(lambda: STORE, require_key=auth.require_key, session_label=auth.session_label,
                 log_activity=_log_activity, owner_profile=_owner_profile)
 
+try:
+    esign.check_enc_key()                           # a mistyped key must stop the server, not switch encryption off
+except esign.EncKeyError as e:
+    sys.exit(str(e))
+
 if hasattr(esign, "ensure_pki"):
     esign.ensure_pki(store.data_dir())
 
@@ -86,7 +91,16 @@ async def lifespan(app: FastAPI):
         task.cancel()
 
 
-app = FastAPI(title=brand.name(), version=VERSION, lifespan=lifespan, docs_url="/api/docs", redoc_url=None)
+# The interactive API docs load Swagger UI from a public CDN. ESIGN_API_DOCS=0 switches them (and /openapi.json) off.
+API_DOCS = (os.environ.get("ESIGN_API_DOCS") or "1").strip() != "0"
+app = FastAPI(title=brand.name(), version=VERSION, lifespan=lifespan, redoc_url=None,
+              docs_url="/api/docs" if API_DOCS else None, openapi_url="/openapi.json" if API_DOCS else None)
+
+# The owner app is plain files from this origin: no inline or third-party script may run in it. Styles and fonts
+# may come from Google Fonts (brand fonts); images may be the brand logo (any https URL) and in-page previews.
+APP_CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+           "font-src 'self' data: https://fonts.gstatic.com; img-src 'self' data: blob: https:; connect-src 'self'; "
+           "object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
 
 
 # ---- request-body limits (see limits.py): checked before the body is read, and before it is parsed to disk ----
@@ -136,7 +150,7 @@ async def _security_headers(request: Request, call_next):
     h.setdefault("Referrer-Policy", "same-origin")
     h.setdefault("X-Frame-Options", "DENY")
     h.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-    if request.url.scheme == "https" or (os.environ.get("ESIGN_PUBLIC_URL") or "").startswith("https://"):
+    if net.is_https(request):
         h.setdefault("Strict-Transport-Security", "max-age=31536000")
     return resp
 
@@ -149,7 +163,7 @@ app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 @app.get("/", include_in_schema=False)
 def home():
-    return FileResponse(STATIC / "app.html", headers={"Cache-Control": "no-cache"})
+    return FileResponse(STATIC / "app.html", headers={"Cache-Control": "no-cache", "Content-Security-Policy": APP_CSP})
 
 
 @app.get("/favicon.svg", include_in_schema=False)

@@ -296,16 +296,28 @@ def _lock(eid: str) -> threading.RLock:
 
 
 # ---- store ----
+class EncKeyError(RuntimeError):
+    pass
+
+
 def _enc_key():
-    k = os.environ.get("ESIGN_ENC_KEY")
+    """The Fernet key files are encrypted with, or None when ESIGN_ENC_KEY is not set. A key that is set but not
+    usable is an error, never a silent fall-back to storing files unencrypted."""
+    k = (os.environ.get("ESIGN_ENC_KEY") or "").strip()
     if not k:
         return None
     try:
         from cryptography.fernet import Fernet
         return Fernet(k.encode())
     except Exception as e:
-        print("ESIGN_ENC_KEY invalid — e-sign files will NOT be encrypted:", e)
-        return None
+        raise EncKeyError("ESIGN_ENC_KEY is set but is not a valid Fernet key (32 url-safe base64-encoded bytes). "
+                          "Generate one with: python -c \"from cryptography.fernet import Fernet; "
+                          "print(Fernet.generate_key().decode())\"") from e
+
+
+def check_enc_key() -> None:
+    """Call at start-up: raises EncKeyError when ESIGN_ENC_KEY is set but unusable."""
+    _enc_key()
 
 
 def _load(eid: str, owner: Optional[str] = None) -> Optional[dict]:

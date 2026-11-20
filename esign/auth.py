@@ -3,7 +3,8 @@
 - First run: while no user exists, POST /v1/auth/setup creates the first admin. It needs the setup token: the value
   of ESIGN_SETUP_TOKEN, or (if that is unset) a random one written to the server log and to <data dir>/.setup-token.
   Without it, whoever reached a fresh deployment first could make themselves the admin.
-- Browser sessions: a signed, HttpOnly cookie (HMAC-SHA256 over user id + session version + expiry with ESIGN_SECRET).
+- Browser sessions: a signed, HttpOnly cookie (HMAC-SHA256 over user id + session version + expiry + a random
+  session id with ESIGN_SECRET). Signing out revokes that one cookie on the server (a copy of it stops working too).
   Signing out everywhere / disabling a user bumps session_ver, which kills every cookie that user holds.
 - API keys: "dsk_" + 40 hex chars, sent as X-API-Key; only a SHA-256 of the key is stored.
 - Every user is their own envelope owner ("u:<user id>"): people see only their own envelopes.
@@ -135,22 +136,39 @@ def _sign(msg: str) -> str:
 
 def _make_cookie(user: dict) -> str:
     exp = int(time.time()) + SESSION_DAYS * 86400
-    msg = f"{user['id']}.{user['session_ver']}.{exp}"
+    msg = f"{user['id']}.{user['session_ver']}.{exp}.{secrets.token_hex(8)}"
     return msg + "." + _sign(msg)
+
+
+def _parse_cookie(raw: str) -> Optional[tuple]:
+    """(user id, session version, expiry) of a cookie we signed that has not expired, else None. Cookies issued
+    before sessions had their own id have four parts instead of five; they stay valid until they expire."""
+    parts = (raw or "").split(".")
+    if len(parts) not in (4, 5):
+        return None
+    msg, mac = ".".join(parts[:-1]), parts[-1]
+    if not hmac.compare_digest(mac, _sign(msg)):
+        return None
+    uid, ver, exp = parts[0], parts[1], parts[2]
+    if not exp.isdigit() or int(exp) < time.time():
+        return None
+    return uid, ver, int(exp)
+
+
+def _session_id(raw: str) -> str:
+    return hashlib.sha256(b"session|" + raw.encode()).hexdigest()[:40]
 
 
 def _user_from_cookie(request: Request) -> Optional[dict]:
     raw = request.cookies.get(COOKIE) or ""
-    parts = raw.split(".")
-    if len(parts) != 4:
+    parsed = _parse_cookie(raw)
+    if not parsed:
         return None
-    uid, ver, exp, mac = parts
-    if not hmac.compare_digest(mac, _sign(f"{uid}.{ver}.{exp}")):
-        return None
-    if not exp.isdigit() or int(exp) < time.time():
-        return None
+    uid, ver, _exp = parsed
     u = _store.get_user(uid)
     if not u or u["disabled"] or str(u["session_ver"]) != ver:
+        return None
+    if _store.session_revoked(_session_id(raw)):     # signed out: the cookie is dead even if somebody kept a copy
         return None
     return u
 
@@ -221,7 +239,7 @@ def _public(u: dict) -> dict:
 
 
 def _set_cookie(resp: Response, request: Request, user: dict):
-    secure = request.url.scheme == "https" or (os.environ.get("ESIGN_PUBLIC_URL") or "").startswith("https://")
+    secure = net.is_https(request)
     resp.set_cookie(COOKIE, _make_cookie(user), max_age=SESSION_DAYS * 86400, httponly=True, secure=secure,
                     samesite="lax", path="/")
 
@@ -233,6 +251,7 @@ LOGIN_ADDR_MAX = 20                                  # sign-in attempts from one
 LOGIN_PAIR_MAX = 10                                  # wrong passwords for one account from one address
 LOGIN_ACCOUNT_FAILS = 50                             # wrong passwords for one account from ALL addresses, after which
 LOGIN_SLOW_GAP = 10                                  # ... addresses new to that account get one try per this many seconds
+PW_CHANGE_MAX = 10                                   # wrong "current password" entries per user
 KNOWN_ADDR_SECS = 30 * 86400                         # how long an address that signed in counts as known to the account
 _limiter = net.Window()
 _known = net.Window(max_keys=5000, max_hits=1)       # (account, address) pairs that signed in; only successes write here
@@ -353,7 +372,11 @@ def login(body: Creds, request: Request, response: Response):
 
 
 @router.post("/v1/auth/logout")
-def logout(response: Response):
+def logout(request: Request, response: Response):
+    raw = request.cookies.get(COOKIE) or ""
+    parsed = _parse_cookie(raw)
+    if parsed:                                       # end the session on the server, not only in this browser
+        _store.revoke_session(_session_id(raw), parsed[2])
     response.delete_cookie(COOKIE, path="/")
     return {"ok": True}
 
@@ -370,8 +393,11 @@ def logout_everywhere(request: Request, response: Response, x_api_key: Optional[
 def change_password(body: PwIn, request: Request, response: Response,
                     x_api_key: Optional[str] = Header(default=None)):
     u = _require_user(request, x_api_key)
+    guard = "pw-change:" + u["id"]
+    _throttle(guard, PW_CHANGE_MAX)                  # a stolen session or key must not get unlimited guesses
     if not check_pw(body.current, u["pw_hash"]):
         raise HTTPException(status_code=401, detail="Your current password is wrong.")
+    _limiter.clear(guard)
     u = _store.update_user(u["id"], pw_hash=hash_pw(body.new), session_ver=int(u["session_ver"]) + 1)
     _set_cookie(response, request, u)
     return {"ok": True}

@@ -34,6 +34,9 @@ _DDL = [
         created_at TEXT NOT NULL, last_used TEXT, revoked INTEGER NOT NULL DEFAULT 0)""",
     """CREATE TABLE IF NOT EXISTS activity (
         id TEXT PRIMARY KEY, ts TEXT NOT NULL, owner TEXT, event_type TEXT, payload TEXT)""",
+    # Sessions ended by "Sign out" before their expiry (id = a hash of the cookie; exp = when the cookie would have
+    # expired anyway, after which the row is no longer needed).
+    "CREATE TABLE IF NOT EXISTS revoked_session (id TEXT PRIMARY KEY, exp BIGINT NOT NULL)",
 ]
 
 
@@ -160,6 +163,16 @@ class _Base:
         sets = ",".join(f"{k}=?" for k in allowed)
         self._exec(self._q(f"UPDATE app_user SET {sets} WHERE id=?"), (*allowed.values(), uid))
         return self.get_user(uid)
+
+    # -- signed-out sessions ------------------------------------------------------------------------------------------
+    def revoke_session(self, sid: str, exp: int) -> None:
+        now = int(_dt.datetime.now(_dt.timezone.utc).timestamp())
+        self._exec(self._q("DELETE FROM revoked_session WHERE exp < ?"), (now,))
+        self._exec(self._q("INSERT INTO revoked_session (id, exp) VALUES (?, ?) ON CONFLICT (id) DO NOTHING"),
+                   (sid, int(exp)))
+
+    def session_revoked(self, sid: str) -> bool:
+        return bool(self._exec(self._q("SELECT 1 FROM revoked_session WHERE id=?"), (sid,), "one"))
 
     # -- API keys ---------------------------------------------------------------------------------------------------
     def create_key(self, user_id, label, key_hash, prefix) -> dict:

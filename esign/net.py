@@ -72,6 +72,16 @@ def _is_private(ip: str) -> bool:
     return any(a in n for n in _INTERNAL if n.version == a.version)
 
 
+def is_https(request) -> bool:
+    """Is the visitor on HTTPS? True for a TLS connection to the app itself, when ESIGN_PUBLIC_URL is an https://
+    address, or when the trusted proxy says so (X-Forwarded-Proto, only with ESIGN_TRUST_PROXY=1)."""
+    if request.url.scheme == "https" or (os.environ.get("ESIGN_PUBLIC_URL") or "").strip().startswith("https://"):
+        return True
+    if trust_proxy():
+        return (request.headers.get("x-forwarded-proto") or "").split(",")[-1].strip().lower() == "https"
+    return False
+
+
 def limit_key(ip: str) -> str:
     """What per-IP rate limits count by: the IPv4 address, or the IPv6 /64 (one host usually owns a whole /64)."""
     try:
