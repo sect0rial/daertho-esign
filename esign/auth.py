@@ -25,6 +25,8 @@ from typing import Optional
 from fastapi import APIRouter, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
+from . import net
+
 router = APIRouter()
 COOKIE = "esign_session"
 SESSION_DAYS = int(os.environ.get("ESIGN_SESSION_DAYS") or 14)
@@ -225,24 +227,54 @@ def _set_cookie(resp: Response, request: Request, user: dict):
 
 
 # ------------------------------------------------------------------------------------------------ rate limit
-_hits: dict = {}
+WINDOW = 900                                         # seconds every limit below is counted over
+SETUP_ADDR_MAX = 10                                  # first-run attempts from one address
+LOGIN_ADDR_MAX = 20                                  # sign-in attempts from one address (any account)
+LOGIN_PAIR_MAX = 10                                  # wrong passwords for one account from one address
+LOGIN_ACCOUNT_FAILS = 50                             # wrong passwords for one account from ALL addresses, after which
+LOGIN_SLOW_GAP = 10                                  # ... addresses new to that account get one try per this many seconds
+KNOWN_ADDR_SECS = 30 * 86400                         # how long an address that signed in counts as known to the account
+_limiter = net.Window()
+_known = net.Window(max_keys=5000, max_hits=1)       # (account, address) pairs that signed in; only successes write here
 
 
-def _throttle(key: str, limit: int, window: int = 900):
-    now = time.time()
-    q = [t for t in _hits.get(key, []) if now - t < window]
-    if len(q) >= limit:
+def _throttle(key: str, limit: int, window: int = WINDOW):
+    if not _limiter.hit(key, limit, window):
         raise HTTPException(status_code=429, detail="Too many attempts — try again in a few minutes.")
-    q.append(now)
-    _hits[key] = q
 
 
 def _ip(request: Request) -> str:
-    if os.environ.get("ESIGN_TRUST_PROXY") == "1":
-        xff = request.headers.get("x-forwarded-for")
-        if xff:
-            return xff.split(",")[0].strip()
-    return request.client.host if request.client else "?"
+    """The address the limits count by. Same rule as the signer evidence (net.client_ip): the TCP peer, or with
+    ESIGN_TRUST_PROXY=1 the LAST X-Forwarded-For hop (the one your proxy wrote), never a hop the client sent.
+    IPv6 counts per /64."""
+    return net.limit_key(net.client_ip(request))[:64]
+
+
+def _login_guard(email: str, addr: str) -> str:
+    """Runs before the password is looked at; returns the key to clear when the sign-in succeeds.
+
+    One address gets LOGIN_ADDR_MAX tries at any account and LOGIN_PAIR_MAX at one account. There is no lockout
+    of an ACCOUNT: an account's own counter only slows down addresses that never signed in to it, so a stranger who
+    knows an email address cannot keep its owner out by typing wrong passwords."""
+    _throttle("login:" + addr, LOGIN_ADDR_MAX)
+    acct = hashlib.sha256(email.encode()).hexdigest()[:24]          # fixed-size key whatever was typed
+    pair = f"login-pair:{acct}|{addr}"
+    _throttle(pair, LOGIN_PAIR_MAX)
+    if _limiter.count("login-fail:" + acct, WINDOW) >= LOGIN_ACCOUNT_FAILS and not _known.count(pair, KNOWN_ADDR_SECS):
+        if not _limiter.hit("login-slow:" + acct, 1, LOGIN_SLOW_GAP):
+            raise HTTPException(status_code=429, detail="Too many attempts — try again in a few seconds.",
+                                headers={"Retry-After": str(LOGIN_SLOW_GAP)})
+    return pair
+
+
+def _login_failed(email: str) -> None:
+    _limiter.add("login-fail:" + hashlib.sha256(email.encode()).hexdigest()[:24], WINDOW)
+
+
+def _login_ok(pair: str) -> None:
+    _limiter.clear(pair)                             # only wrong passwords count against (account, address)
+    _known.clear(pair)
+    _known.add(pair, KNOWN_ADDR_SECS)
 
 
 # ------------------------------------------------------------------------------------------------ routes
@@ -287,7 +319,7 @@ def me(request: Request, x_api_key: Optional[str] = Header(default=None)):
 
 @router.post("/v1/auth/setup")
 def setup(body: SetupIn, request: Request, response: Response):
-    _throttle("setup:" + _ip(request), 10)
+    _throttle("setup:" + _ip(request), SETUP_ADDR_MAX)
     if _store.count_users() > 0:
         raise HTTPException(status_code=409, detail="Setup is already done — sign in instead.")
     if not _setup_token_ok(body.setup_token):
@@ -308,13 +340,14 @@ def setup(body: SetupIn, request: Request, response: Response):
 
 @router.post("/v1/auth/login")
 def login(body: Creds, request: Request, response: Response):
-    _throttle("login:" + _ip(request), 20)
     email = (body.email or "").strip().lower()
-    _throttle("login-user:" + email, 10)
+    pair = _login_guard(email, _ip(request))
     u = _store.get_user_by_email(email)
     ok = check_pw(body.password, u["pw_hash"] if u else _DUMMY)
     if not u or not ok or u["disabled"]:
+        _login_failed(email)
         raise HTTPException(status_code=401, detail="Wrong email or password.")
+    _login_ok(pair)
     _set_cookie(response, request, u)
     return {"user": _public(u)}
 

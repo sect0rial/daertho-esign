@@ -118,6 +118,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 Changes that need a moment of your attention when you pull a newer version:
 
 - **First-run setup needs a token.** `POST /v1/auth/setup` now answers 403 without the setup token (`setup_token` in the JSON body). Before this, the first visitor to a fresh deployment could create the admin account. Servers that already have an account are not affected. For a new one, set `ESIGN_SETUP_TOKEN` or read the token from the start-up log.
+- **Sign-in limits count by the real client address.** With `ESIGN_TRUST_PROXY=1` the sign-in and first-run limits now use the last `X-Forwarded-For` hop (the one your proxy wrote), the same rule the signer evidence already used. Before this they used the first hop, which the client controls. Wrong passwords are now counted per account *and* address (10 in 15 minutes), so somebody who knows a user's email can no longer lock that user out. Nothing to change in your settings, but check that your proxy really is the only way to reach the app.
 
 ## Security
 

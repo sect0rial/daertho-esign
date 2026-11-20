@@ -49,6 +49,7 @@ from pydantic import BaseModel, Field
 from . import esign_pdf as P
 from . import esign_seal as SEAL
 from . import brand
+from . import net
 
 router = APIRouter()
 STATIC = Path(__file__).resolve().parent / "static"
@@ -203,33 +204,14 @@ def _clean(s, maxlen: int) -> str:
 
 
 def _client_ip(request: Optional[Request]) -> str:
-    """The visitor's IP. With ESIGN_TRUST_PROXY=1 (only when the app is reachable solely through your own reverse
-    proxy / platform router): the LAST X-Forwarded-For hop, the one that proxy wrote — never a left-hand hop or a
-    CF-Connecting-IP header the client could have sent itself. Otherwise the TCP peer address."""
-    if request is None:
-        return ""
-    if (os.environ.get("ESIGN_TRUST_PROXY") or "").strip() == "1":
-        xff = (request.headers.get("x-forwarded-for") or "").split(",")[-1].strip()
-        if xff and re.match(r"^[0-9A-Fa-f:.]{2,45}$", xff):
-            return xff
-    try:
-        return (request.client.host if request.client else "") or ""
-    except Exception:
-        return ""
+    """The visitor's IP: the last X-Forwarded-For hop when ESIGN_TRUST_PROXY=1, else the TCP peer (see net.py; the
+    sign-in limits use the same rule)."""
+    return net.client_ip(request)
 
 
 def _limit_key(ip: str) -> str:
-    """What per-IP rate limits count by: the IPv4 address, or the IPv6 /64 (one host usually owns a whole /64)."""
-    import ipaddress
-    try:
-        a = ipaddress.ip_address(ip)
-    except ValueError:
-        return ip or "unknown"
-    if a.version == 6:
-        if a.ipv4_mapped:
-            return str(a.ipv4_mapped)
-        return str(ipaddress.ip_network(f"{a}/64", strict=False))
-    return str(a)
+    """What per-IP rate limits count by: the IPv4 address, or the IPv6 /64."""
+    return net.limit_key(ip)
 
 
 def _ip(request: Optional[Request]) -> str:

@@ -1,4 +1,4 @@
-"""Deployment hardening: the first-run setup token."""
+"""Deployment hardening: the first-run setup token, and sign-in limits that count by the real client address."""
 import importlib
 import sys
 import threading
@@ -122,3 +122,115 @@ def test_cli_prints_the_pending_setup_token(start, tmp_path, capsys):
     capsys.readouterr()
     cli.main(["setup-token"])
     assert capsys.readouterr().out.strip() == token
+
+
+# ------------------------------------------------------------------------------------------- sign-in limits
+PROXY = "203.0.113.7"                                # the hop our own proxy appends: the real client address
+
+
+def _login(c, email, pw, addr=None, spoof=None):
+    """A sign-in as it arrives through the proxy: X-Forwarded-For = [what the client sent, ] real address."""
+    headers = {}
+    if addr:
+        headers["X-Forwarded-For"] = (spoof + ", " if spoof else "") + addr
+    return c.post("/v1/auth/login", json={"email": email, "password": pw}, headers=headers)
+
+
+def _admin(c):
+    r = c.post("/v1/auth/setup", json={**ADMIN, "setup_token": TOKEN})
+    assert r.status_code == 200, r.text
+    c.cookies.clear()
+
+
+def test_one_rule_for_the_client_address(monkeypatch):
+    from starlette.requests import Request
+    from esign import auth, esign as E, net
+
+    def req(xff=None, peer="192.0.2.10"):
+        headers = [(b"x-forwarded-for", xff.encode())] if xff else []
+        return Request({"type": "http", "headers": headers, "client": (peer, 1234)})
+
+    monkeypatch.setenv("ESIGN_TRUST_PROXY", "1")
+    r = req("198.51.100.99, 203.0.113.7")
+    assert net.client_ip(r) == E._client_ip(r) == auth._ip(r) == "203.0.113.7"       # last hop, never the first
+    assert auth._ip(req("2001:db8:1:2:aaaa::1")) == E._ipk(req("2001:db8:1:2:bbbb::2")) == "2001:db8:1:2::/64"
+    assert auth._ip(req("not an address")) == "192.0.2.10"
+    monkeypatch.setenv("ESIGN_TRUST_PROXY", "0")
+    assert net.client_ip(r) == E._client_ip(r) == auth._ip(r) == "192.0.2.10"        # header ignored entirely
+
+
+def test_sign_in_limit_ignores_hops_the_client_sent(start):
+    c = start(ESIGN_TRUST_PROXY="1")
+    codes = [_login(c, f"user{i}@example.com", "wrong password", PROXY, spoof=f"198.51.100.{i}").status_code
+             for i in range(24)]
+    assert codes[:20] == [401] * 20 and codes[20:] == [429] * 4
+
+
+def test_setup_limit_ignores_hops_the_client_sent(start):
+    c = start(ESIGN_TRUST_PROXY="1")
+    codes = [c.post("/v1/auth/setup", json=ADMIN, headers={"X-Forwarded-For": f"198.51.100.{i}, {PROXY}"}).status_code
+             for i in range(12)]
+    assert codes[:10] == [403] * 10 and codes[10:] == [429] * 2
+
+
+def test_forwarded_header_means_nothing_without_trust_proxy(start):
+    c = start()
+    codes = [c.post("/v1/auth/login", json={"email": f"user{i}@example.com", "password": "wrong password"},
+                    headers={"X-Forwarded-For": f"198.51.100.{i}"}).status_code for i in range(22)]
+    assert codes[:20] == [401] * 20 and codes[20:] == [429] * 2
+
+
+def test_wrong_passwords_from_one_address_do_not_lock_the_account(start):
+    c = start(ESIGN_TRUST_PROXY="1")
+    _admin(c)
+    attacker, owner = "198.51.100.66", "192.0.2.44"
+    codes = [_login(c, ADMIN["email"], "wrong password", attacker).status_code for _ in range(13)]
+    assert codes[:10] == [401] * 10 and codes[10:] == [429] * 3
+    assert _login(c, ADMIN["email"], ADMIN["password"], attacker).status_code == 429   # that address stays shut out
+    assert _login(c, ADMIN["email"], ADMIN["password"], owner).status_code == 200      # the real owner is not
+
+
+def test_a_successful_sign_in_clears_the_wrong_password_count(start):
+    c = start(ESIGN_TRUST_PROXY="1")
+    _admin(c)
+    addr = "192.0.2.44"
+    assert [_login(c, ADMIN["email"], "wrong password", addr).status_code for _ in range(8)] == [401] * 8
+    assert _login(c, ADMIN["email"], ADMIN["password"], addr).status_code == 200
+    c.cookies.clear()
+    assert [_login(c, ADMIN["email"], "wrong password", addr).status_code for _ in range(8)] == [401] * 8
+
+
+def test_guessing_from_many_addresses_slows_strangers_but_not_the_owner(start, monkeypatch):
+    import time
+    from esign import auth
+    monkeypatch.setattr(auth, "check_pw", lambda pw, stored: pw == ADMIN["password"])   # skip the slow hash
+    monkeypatch.setattr(auth, "LOGIN_SLOW_GAP", 0.3)
+    c = start(ESIGN_TRUST_PROXY="1")
+    _admin(c)
+    owner = "192.0.2.44"
+    assert _login(c, ADMIN["email"], ADMIN["password"], owner).status_code == 200      # the owner's usual address
+    c.cookies.clear()
+    for a in range(5):                                                                 # 50 wrong passwords, 5 addresses
+        for _ in range(10):
+            assert _login(c, ADMIN["email"], "wrong password", f"198.51.100.{a}").status_code == 401
+    assert _login(c, ADMIN["email"], "wrong password", "198.51.100.200").status_code == 401   # takes the one slot
+    r = _login(c, ADMIN["email"], "wrong password", "198.51.100.201")
+    assert r.status_code == 429 and r.headers.get("retry-after")
+    assert _login(c, ADMIN["email"], ADMIN["password"], owner).status_code == 200      # known address: not slowed
+    c.cookies.clear()
+    time.sleep(0.35)
+    assert _login(c, ADMIN["email"], ADMIN["password"], "192.0.2.99").status_code == 200   # slowed, never locked
+
+
+def test_limit_counters_are_bounded():
+    from esign import net
+    w = net.Window(max_keys=50, max_hits=20)
+    for i in range(500):
+        w.add(f"k{i}", 900)
+    assert len(w) == 50 and w.count("k499", 900) == 1 and w.count("k0", 900) == 0
+    for _ in range(200):
+        w.add("busy", 900)
+    assert w.count("busy", 900) == 20
+    assert w.hit("x", 2, 900) and w.hit("x", 2, 900) and not w.hit("x", 2, 900)
+    w.clear("x")
+    assert w.hit("x", 2, 900)
