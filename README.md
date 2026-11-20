@@ -64,7 +64,21 @@ Everything is an environment variable. `.env.example` lists all of them with com
 | `ESIGN_MAIL`, `ESIGN_SMTP_*` | Turn on emailed links (any SMTP provider: SES, Postmark, Resend, Google Workspace, Mailgun…). |
 | `ESIGN_SEAL_P12`, `ESIGN_SEAL_PASS` | Your own seal certificate. If empty, one is generated on first boot (see below). |
 | `ESIGN_TSA_URLS` | Timestamp servers. Defaults to free public ones. `off` disables timestamping. |
+| `ESIGN_MAX_BODY_MB`, `ESIGN_VERIFY_MAX_MB` | Request-size limits, in megabytes (see below). Defaults: 8 and 500. |
 | `ESIGN_BRAND_*` | Name, legal name, logo URL, accent/background/ink colours, Google Font families, support email, and whether to hide "Powered by". |
+
+### Request-size limits
+
+The app refuses a request that is too large before it reads it, and on the owner routes it checks the sign-in before it reads an upload, so a stranger cannot fill the disk with uploads that would have been refused anyway.
+
+| Request | Limit |
+|---|---|
+| Document upload (signed in) | 25 MB per file |
+| Verify a PDF (signed in) | `ESIGN_VERIFY_MAX_MB`, default 500 MB. Files above 60 MB are hash-checked only. |
+| Sign-in, setup, users, API keys | 64 KB |
+| Everything else, including the signer's submission | `ESIGN_MAX_BODY_MB`, default 8 MB. Don't go below 7: a signer's drawn signatures can take up to 6 MB. |
+
+If you run a reverse proxy in front, set its own limit too, so oversized requests are dropped at the edge. For nginx that is `client_max_body_size 501m;` (or lower if you lowered `ESIGN_VERIFY_MAX_MB`). Caddy has `request_body { max_size 501MB }`.
 
 ### The seal certificate
 
@@ -119,6 +133,7 @@ Changes that need a moment of your attention when you pull a newer version:
 
 - **First-run setup needs a token.** `POST /v1/auth/setup` now answers 403 without the setup token (`setup_token` in the JSON body). Before this, the first visitor to a fresh deployment could create the admin account. Servers that already have an account are not affected. For a new one, set `ESIGN_SETUP_TOKEN` or read the token from the start-up log.
 - **Sign-in limits count by the real client address.** With `ESIGN_TRUST_PROXY=1` the sign-in and first-run limits now use the last `X-Forwarded-For` hop (the one your proxy wrote), the same rule the signer evidence already used. Before this they used the first hop, which the client controls. Wrong passwords are now counted per account *and* address (10 in 15 minutes), so somebody who knows a user's email can no longer lock that user out. Nothing to change in your settings, but check that your proxy really is the only way to reach the app.
+- **Request-size limits.** Requests above the limits in [Request-size limits](#request-size-limits) now get 413 before they are read, and an upload to an owner route gets 401 before it is read if the caller isn't signed in. If you post JSON bodies above 8 MB to the API, raise `ESIGN_MAX_BODY_MB`.
 
 ## Security
 

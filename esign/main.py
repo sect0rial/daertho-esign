@@ -10,15 +10,16 @@ import asyncio
 import contextlib
 import hashlib
 import os
+import re
 import secrets
 import sys
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import auth, brand, esign, store
+from . import auth, brand, esign, esign_pdf, limits, store
 
 STATIC = Path(__file__).resolve().parent / "static"
 VERSION = "0.1.0"
@@ -86,6 +87,45 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title=brand.name(), version=VERSION, lifespan=lifespan, docs_url="/api/docs", redoc_url=None)
+
+
+# ---- request-body limits (see limits.py): checked before the body is read, and before it is parsed to disk ----
+def _env_mb(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ.get(name) or default)) * limits.MB
+    except ValueError:
+        sys.exit(f"{name} must be a whole number of megabytes")
+
+
+MAX_BODY = _env_mb("ESIGN_MAX_BODY_MB", 8)                                        # any request not listed below
+MAX_AUTH_BODY = 64 * 1024                                                         # sign-in, setup, users, keys
+_DOC_UPLOAD = re.compile(r"^/v1/esign/envelopes/[^/]+/documents$")
+
+
+def _body_rule(method: str, path: str):
+    """(max body bytes, needs a signed-in user) for a request. Every /v1/esign/ route is an owner route."""
+    if path.startswith("/v1/esign/"):
+        if method == "POST" and path == "/v1/esign/verify":
+            return esign.verify_max_bytes() + limits.MARGIN, True
+        if method == "POST" and _DOC_UPLOAD.match(path):
+            return esign_pdf.MAX_FILE_BYTES + limits.MARGIN, True
+        return MAX_BODY, True
+    if path.startswith("/v1/auth/"):
+        return MAX_AUTH_BODY, False
+    return MAX_BODY, False
+
+
+def _signed_in(request: Request):
+    """None if the request carries a valid session or API key, else the (status, message) to answer with."""
+    try:
+        user = auth.current_user(request, request.headers.get("x-api-key"))
+    except HTTPException as e:
+        return e.status_code, str(e.detail)
+    return None if user else (401, "Sign in first.")
+
+
+# Added before the security-headers middleware below, so it runs inside it and its answers carry those headers too.
+app.add_middleware(limits.BodyLimitMiddleware, rule=_body_rule, authenticate=_signed_in)
 
 
 @app.middleware("http")

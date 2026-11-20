@@ -2452,6 +2452,16 @@ def owner_download(eid: str, request: Request, kind: str = "combined", caller: s
 VERIFY_SEAL_MAX = MAX_ENVELOPE_BYTES              # files above this are hash-checked only
 
 
+def verify_max_bytes() -> int:
+    """The biggest file the Verify page accepts (signed-in users only; ESIGN_VERIFY_MAX_MB, default 500). The app's
+    body-limit middleware enforces the same figure before the upload is read."""
+    try:
+        mb = int(os.environ.get("ESIGN_VERIFY_MAX_MB") or 500)
+    except ValueError:
+        mb = 500
+    return max(1, mb) * 1024 * 1024
+
+
 @router.post("/v1/esign/verify")
 def verify_document(request: Request, file: UploadFile = File(...), caller: str = Depends(_caller)):
     hh, total, first = hashlib.sha256(), 0, b""
@@ -2462,7 +2472,7 @@ def verify_document(request: Request, file: UploadFile = File(...), caller: str 
         if not first:
             first = chunk[:5]
         total += len(chunk)
-        if total > 500 * 1024 * 1024:
+        if total > verify_max_bytes():
             raise HTTPException(status_code=413, detail="That file is too large to verify.")
         hh.update(chunk)
     h = hh.hexdigest()

@@ -1,4 +1,6 @@
-"""Deployment hardening: the first-run setup token, and sign-in limits that count by the real client address."""
+"""Deployment hardening: the first-run setup token, sign-in limits that count by the real client address, and
+request-body limits that apply before an upload is read."""
+import asyncio
 import importlib
 import sys
 import threading
@@ -234,3 +236,130 @@ def test_limit_counters_are_bounded():
     assert w.hit("x", 2, 900) and w.hit("x", 2, 900) and not w.hit("x", 2, 900)
     w.clear("x")
     assert w.hit("x", 2, 900)
+
+
+# ------------------------------------------------------------------------------------------- request-body limits
+MB = 1024 * 1024
+PDF = b"%PDF-1.4\n" + b"0" * 2048
+
+
+@pytest.fixture()
+def parsed(monkeypatch):
+    """Counts how many multipart bodies the server started to parse (parsing is what spools an upload to disk)."""
+    from starlette import formparsers
+    calls = []
+    real = formparsers.MultiPartParser.parse
+
+    async def spy(self):
+        calls.append(1)
+        return await real(self)
+
+    monkeypatch.setattr(formparsers.MultiPartParser, "parse", spy)
+    return calls
+
+
+def _signed_in(start, **env):
+    c = start(**env)
+    assert c.post("/v1/auth/setup", json={**ADMIN, "setup_token": TOKEN}).status_code == 200
+    return c
+
+
+def test_upload_from_a_stranger_is_refused_before_it_is_parsed(start, parsed):
+    c = start()
+    big = {"file": ("x.pdf", b"%PDF-1.4\n" + b"0" * (2 * MB), "application/pdf")}
+    r = c.post("/v1/esign/verify", files=big)
+    assert r.status_code == 401 and r.headers["x-content-type-options"] == "nosniff"
+    assert c.post("/v1/esign/envelopes/" + "0" * 32 + "/documents", files=big).status_code == 401
+    assert c.post("/v1/esign/verify", files=big, headers={"X-API-Key": "dsk_" + "0" * 40}).status_code == 401
+    assert c.post("/v1/esign/envelopes", content=b"x" * 4096,
+                  headers={"Content-Type": "application/json"}).status_code == 401
+    assert parsed == []                               # nothing was read into a temp file
+
+
+def test_oversized_upload_is_refused_by_its_declared_length(start, parsed):
+    c = _signed_in(start)
+    eid = c.post("/v1/esign/envelopes", json={"title": "Big"}).json()["id"]
+    r = c.post(f"/v1/esign/envelopes/{eid}/documents",
+               files={"file": ("big.pdf", b"%PDF-1.4\n" + b"0" * (27 * MB), "application/pdf")})
+    assert r.status_code == 413 and "too large" in r.json()["detail"]
+    assert parsed == []
+    r = c.post(f"/v1/esign/envelopes/{eid}/documents", files={"file": ("small.pdf", PDF, "application/pdf")})
+    assert r.status_code != 413 and parsed == [1]     # a normal upload still reaches the handler
+
+
+def test_verify_keeps_its_own_limit_for_signed_in_users(start, parsed):
+    c = _signed_in(start, ESIGN_VERIFY_MAX_MB="40")
+    r = c.post("/v1/esign/verify", files={"file": ("a.bin", b"a" * (30 * MB), "application/octet-stream")})
+    assert r.status_code == 200 and r.json()["match"] is False       # above the 25 MB document limit, still fine
+    assert parsed == [1]
+    r = c.post("/v1/esign/verify", files={"file": ("a.bin", b"a" * (42 * MB), "application/octet-stream")})
+    assert r.status_code == 413 and parsed == [1]
+
+
+def test_account_and_other_routes_have_small_limits(start):
+    c = start()
+    r = c.post("/v1/auth/login", json={"email": "a@example.com", "password": "x" * 100, "pad": "y" * (100 * 1024)})
+    assert r.status_code == 413
+    r = c.post("/v1/sign/" + "x" * 40 + "/complete", content=b"z" * (9 * MB),
+               headers={"Content-Type": "application/json"})
+    assert r.status_code == 413
+    assert c.post("/v1/auth/login", json={"email": "a@example.com", "password": "wrong password"}).status_code == 401
+
+
+def test_body_without_a_declared_length_is_cut_off_through_the_app(start):
+    c = start()
+
+    def chunks():
+        for _ in range(4):
+            yield b"y" * (50 * 1024)
+
+    r = c.post("/v1/auth/login", content=chunks(), headers={"Content-Type": "application/json"})
+    assert "content-length" not in r.request.headers
+    assert r.status_code == 413
+
+
+def _run_middleware(limit, chunks, headers=(), needs_auth=False, authenticate=None):
+    """Drive BodyLimitMiddleware directly with a body that arrives in pieces; returns (status, bytes the app got)."""
+    from esign import limits
+    got, sent = [], []
+
+    async def app(scope, receive, send):
+        while True:
+            m = await receive()
+            got.append(len(m.get("body") or b""))
+            if not m.get("more_body"):
+                break
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    pending = list(chunks)
+
+    async def receive():
+        body = pending.pop(0)
+        return {"type": "http.request", "body": body, "more_body": bool(pending)}
+
+    async def send(m):
+        sent.append(m)
+
+    mw = limits.BodyLimitMiddleware(app, rule=lambda method, path: (limit, needs_auth), authenticate=authenticate)
+    scope = {"type": "http", "method": "POST", "path": "/x", "headers": list(headers), "query_string": b""}
+    asyncio.run(mw(scope, receive, send))
+    return sent[0]["status"], sum(got), len(pending)
+
+
+def test_chunked_body_is_cut_off_at_the_limit():
+    chunked = [(b"transfer-encoding", b"chunked")]
+    status, got, unread = _run_middleware(3 * MB, [b"a" * MB] * 10, chunked)
+    assert status == 413 and got <= 3 * MB and unread == 6           # stopped reading; the rest never left the socket
+    assert _run_middleware(3 * MB, [b"a" * MB] * 3, chunked)[0] == 200
+    assert _run_middleware(3 * MB, [b"a"], [(b"content-length", str(4 * MB).encode())])[:2] == (413, 0)
+    assert _run_middleware(3 * MB, [b"a"], [(b"content-length", b"-5")])[:2] == (400, 0)
+    assert _run_middleware(3 * MB, [b"a"], [(b"content-length", b"1, 1")])[:2] == (400, 0)
+
+
+def test_sign_in_is_checked_before_the_body_is_read():
+    chunked = [(b"transfer-encoding", b"chunked")]
+    refuse = lambda request: (401, "Sign in first.")
+    assert _run_middleware(MB, [b"a" * 10] * 3, chunked, True, refuse) == (401, 0, 3)
+    assert _run_middleware(MB, [b"a" * 10] * 3, chunked, True, lambda request: None) == (200, 30, 0)
+    assert _run_middleware(MB, [b""], [], True, refuse)[0] == 200    # no body: the route does its own check
